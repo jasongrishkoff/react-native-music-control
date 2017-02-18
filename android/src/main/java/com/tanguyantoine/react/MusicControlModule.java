@@ -86,7 +86,9 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
         pb = new PlaybackStateCompat.Builder();
         pb.setActions(controls);
         nb = new NotificationCompat.Builder(context);
-        nb.setStyle(new NotificationCompat.MediaStyle().setMediaSession(session.getSessionToken()));
+        nb.setStyle(new NotificationCompat.MediaStyle()
+            .setShowActionsInCompactView(0, 1, 2)
+            .setMediaSession(session.getSessionToken()));
 
         notification = new MusicControlNotification(context);
         notification.updateActions(controls);
