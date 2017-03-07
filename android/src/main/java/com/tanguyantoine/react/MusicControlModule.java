@@ -1,11 +1,16 @@
 package com.tanguyantoine.react;
 
+import android.content.ComponentCallbacks2;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
 import android.media.AudioManager;
+import android.os.SystemClock;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.RatingCompat;
 import android.support.v4.media.session.MediaSessionCompat;
@@ -16,6 +21,8 @@ import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.ReadableType;
+import com.facebook.react.views.imagehelper.ResourceDrawableIdHelper;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
@@ -23,7 +30,7 @@ import java.net.URLConnection;
 import java.util.HashMap;
 import java.util.Map;
 
-public class MusicControlModule extends ReactContextBaseJavaModule {
+public class MusicControlModule extends ReactContextBaseJavaModule implements ComponentCallbacks2 {
 
     static MusicControlModule INSTANCE;
 
@@ -34,13 +41,15 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
     private PlaybackStateCompat.Builder pb;
     private NotificationCompat.Builder nb;
 
+    private PlaybackStateCompat state;
+
     protected MusicControlNotification notification;
     private MusicControlListener.VolumeListener volume;
     private MusicControlReceiver receiver;
-    private boolean remoteVolume = false;
 
     private Thread artworkThread;
 
+    private boolean remoteVolume = false;
     private boolean isPlaying = false;
     private long controls = 0;
 
@@ -65,6 +74,8 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
     }
 
     public void init() {
+        if(init) return;
+
         INSTANCE = this;
         ReactApplicationContext context = getReactApplicationContext();
 
@@ -90,6 +101,8 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
             .setShowActionsInCompactView(0, 1, 2)
             .setMediaSession(session.getSessionToken()));
 
+        state = pb.build();
+
         notification = new MusicControlNotification(context);
         notification.updateActions(controls);
 
@@ -102,14 +115,22 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
 
         context.startService(new Intent(context, MusicControlNotification.NotificationService.class));
 
+        context.registerComponentCallbacks(this);
+
         isPlaying = false;
         init = true;
     }
 
     public void destroy() {
+        if(!init) return;
+
         notification.hide();
         session.release();
-        getReactApplicationContext().unregisterReceiver(receiver);
+
+        ReactApplicationContext context = getReactApplicationContext();
+
+        context.unregisterReceiver(receiver);
+        context.unregisterComponentCallbacks(this);
 
         if(artworkThread != null && artworkThread.isAlive()) artworkThread.interrupt();
         artworkThread = null;
@@ -118,6 +139,7 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
         notification = null;
         volume = null;
         receiver = null;
+        state = null;
         md = null;
         pb = null;
         nb = null;
@@ -142,9 +164,19 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
         String description = metadata.hasKey("description") ? metadata.getString("description") : null;
         String date = metadata.hasKey("date") ? metadata.getString("date") : null;
         RatingCompat rating = metadata.hasKey("rating") ? RatingCompat.newPercentageRating(metadata.getInt("rating")) : RatingCompat.newUnratedRating(RatingCompat.RATING_PERCENTAGE);
-        final String artwork = metadata.hasKey("artwork") ? metadata.getString("artwork") : null;
         long duration = metadata.hasKey("duration") ? (long)(metadata.getDouble("duration") * 1000) : 0;
         int notificationColor = metadata.hasKey("color") ? metadata.getInt("color") : NotificationCompat.COLOR_DEFAULT;
+
+        String artwork = null;
+        boolean localArtwork = false;
+        if(metadata.hasKey("artwork")) {
+            if(metadata.getType("artwork") == ReadableType.Map) {
+                artwork = metadata.getMap("artwork").getString("uri");
+                localArtwork = true;
+            } else {
+                artwork = metadata.getString("artwork");
+            }
+        }
 
         md.putText(MediaMetadataCompat.METADATA_KEY_TITLE, title);
         md.putText(MediaMetadataCompat.METADATA_KEY_ARTIST, artist);
@@ -161,10 +193,13 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
         nb.setColor(notificationColor);
 
         if(artwork != null) {
+            final String artworkUrl = artwork;
+            final boolean artworkLocal = localArtwork;
+
             artworkThread = new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    Bitmap bitmap = loadArtwork(artwork);
+                    Bitmap bitmap = loadArtwork(artworkUrl, artworkLocal);
                     md.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, bitmap);
                     nb.setLargeIcon(bitmap);
 
@@ -185,24 +220,33 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
-    public void setPlayback(ReadableMap info) {
+    public void updatePlayback(ReadableMap info) {
         if(!init) init();
 
-        long elapsedTime = info.hasKey("elapsedTime") ? (long)(info.getDouble("elapsedTime") * 1000) : 0;
-        long bufferedTime = info.hasKey("bufferedTime") ? (long)(info.getDouble("bufferedTime") * 1000) : 0;
-        float speed = info.hasKey("speed") ? (float)info.getDouble("speed") : 1;
-        int state = info.hasKey("state") ? info.getInt("state") : PlaybackStateCompat.STATE_NONE;
-        int maxVol = info.hasKey("maxVolume") ? info.getInt("maxVol") : 100;
-        int vol = info.hasKey("volume") ? info.getInt("volume") : maxVol;
+        long elapsedTime;
+        long bufferedTime = info.hasKey("bufferedTime") ? (long)(info.getDouble("bufferedTime") * 1000) : state.getBufferedPosition();
+        float speed = info.hasKey("speed") ? (float)info.getDouble("speed") : state.getPlaybackSpeed();
+        int pbState = info.hasKey("state") ? info.getInt("state") : state.getState();
+        int maxVol = info.hasKey("maxVolume") ? info.getInt("maxVolume") : volume.getMaxVolume();
+        int vol = info.hasKey("volume") ? info.getInt("volume") : volume.getCurrentVolume();
 
-        pb.setState(state, elapsedTime, speed);
+        if(info.hasKey("elapsedTime")) {
+            elapsedTime = (long)(info.getDouble("elapsedTime") * 1000);
+        } else {
+            // Calculates the new elapsed time based on the state and speed
+            long deltaTime = SystemClock.elapsedRealtime() - state.getLastPositionUpdateTime();
+            if(state.getState() != PlaybackStateCompat.STATE_PLAYING) deltaTime = 0;
+            elapsedTime = state.getPosition() + (long)(deltaTime * speed);
+        }
+
+        pb.setState(pbState, elapsedTime, speed);
         pb.setBufferedPosition(bufferedTime);
 
-        isPlaying = state == PlaybackStateCompat.STATE_PLAYING || state == PlaybackStateCompat.STATE_BUFFERING;
+        isPlaying = pbState == PlaybackStateCompat.STATE_PLAYING || pbState == PlaybackStateCompat.STATE_BUFFERING;
         notification.show(nb, isPlaying);
 
-        PlaybackStateCompat playbackState = pb.build();
-        session.setPlaybackState(playbackState);
+        state = pb.build();
+        session.setPlaybackState(state);
 
         if(remoteVolume) {
             session.setPlaybackToRemote(volume.create(null, maxVol, vol));
@@ -218,7 +262,6 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
         artworkThread = null;
 
         md = new MediaMetadataCompat.Builder();
-        pb = new PlaybackStateCompat.Builder();
 
         notification.hide();
         session.setActive(false);
@@ -257,16 +300,12 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
             case "seekBackward":
                 controlValue = PlaybackStateCompat.ACTION_REWIND;
                 break;
-            case "rate":
+            case "setRating":
                 controlValue = PlaybackStateCompat.ACTION_SET_RATING;
                 break;
             case "volume":
                 volume = volume.create(enable, null, null);
-                if(remoteVolume) {
-                    session.setPlaybackToRemote(volume);
-                } else {
-                    session.setPlaybackToLocal(AudioManager.STREAM_MUSIC);
-                }
+                if(remoteVolume) session.setPlaybackToRemote(volume);
                 return;
             case "remoteVolume":
                 remoteVolume = enable;
@@ -291,22 +330,59 @@ public class MusicControlModule extends ReactContextBaseJavaModule {
         session.setPlaybackState(pb.build());
     }
 
-    private Bitmap loadArtwork(String url) {
+    private Bitmap loadArtwork(String url, boolean local) {
         Bitmap bitmap = null;
+
         try {
-            if(url.matches("^(https?|ftp)://.*$")) { // URL
+            if(local) {
+
+                // Gets the drawable from the RN's helper for local resources
+                ResourceDrawableIdHelper helper = ResourceDrawableIdHelper.getInstance();
+                Drawable image = helper.getResourceDrawable(getReactApplicationContext(), url);
+
+                if(image instanceof BitmapDrawable) {
+                    bitmap = ((BitmapDrawable)image).getBitmap();
+                } else {
+                    bitmap = BitmapFactory.decodeFile(url);
+                }
+
+            } else {
+
+                // Open connection to the URL and decodes the image
                 URLConnection con = new URL(url).openConnection();
                 con.connect();
                 InputStream input = con.getInputStream();
                 bitmap = BitmapFactory.decodeStream(input);
                 input.close();
-            } else { // File
-                bitmap = BitmapFactory.decodeFile(url);
+
             }
         } catch(IOException ex) {
             Log.w("MusicControl", "Could not load the artwork", ex);
         }
+
         return bitmap;
     }
 
+    @Override
+    public void onTrimMemory(int level) {
+        switch(level) {
+            case ComponentCallbacks2.TRIM_MEMORY_COMPLETE:
+            case ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL:
+            case ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE:
+                Log.w("MusicControl", "Control resources are being removed due to system's low memory (" + level + ")");
+                destroy();
+                break;
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+
+    }
+
+    @Override
+    public void onLowMemory() {
+        Log.w("MusicControl", "Control resources are being removed due to system's low memory");
+        destroy();
+    }
 }
